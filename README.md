@@ -30,6 +30,14 @@ Pre-build. Only the README exists. Reference video not uploaded yet.
 3. Lotus flowers bounce when the boat touches them, matching the reference video.
 4. The guide hand plays until the player first draws a line.
 
+## Physics behavior
+
+- **Boat hits lotus:** lotus is pushed away from the boat, in the direction of the hit.
+- **Push distance:** lotus slides a fixed distance, then stops.
+- **Stop:** ease-out (decelerates smoothly to zero). No abrupt stop.
+- **Boat passes near leaf or lotus:** small push, not a full collision. Pads drift a little with the ripple.
+- **Waves:** gentle ripple across the pond. Pads bob slightly over time, even when the boat is far.
+
 ## Technical plan
 
 - Single `index.html`. Vanilla JavaScript, HTML canvas.
