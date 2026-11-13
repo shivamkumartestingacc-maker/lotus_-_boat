@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Lotus Boat</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #3aa6e4; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  .glass {
+    position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 28px);
+    transform: translateX(-50%);
+    padding: 14px 26px; border-radius: 999px; border: 1px solid rgba(255,255,255,.45);
+    background: rgba(255,255,255,.18);
+    -webkit-backdrop-filter: blur(14px) saturate(140%); backdrop-filter: blur(14px) saturate(140%);
+    box-shadow: 0 8px 32px rgba(0,40,80,.25);
+    color: #fff; font: 600 16px/1 system-ui, sans-serif; letter-spacing: .3px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .glass.flash { background: rgba(255,255,255,.4); }
+</style>
+</head>
+<body>
+<canvas id="pond"></canvas>
+<button class="glass" id="soon" type="button">Game coming soon</button>
+<script>
+const cv = document.getElementById('pond');
+const ctx = cv.getContext('2d');
+const TAU = Math.PI * 2;
+
+// tuning
+const BOAT_R = 70;        // circle collider approximating hull
+const WRAP_M = 80;        // off-screen margin before wrap
+const PUSH_FULL = 70;     // px pad slides on contact
+const PUSH_NEAR = 10;     // px pad slides when boat brushes past
+const NEAR_GAP = 36;      // px outside contact ring that counts as "brush"
+const PUSH_TIME = 0.9;    // s ease-out duration of a slide
+const PATH_SPEED = 170;   // px/s along drawn path
+const ACC = 900;          // px/s^2 arrow-key thrust
+const MAX_V = 320;        // px/s key speed cap
+const FRICTION = 1.4;     // 1/s inertia decay when no key held
+
+let W = 0, H = 0, time = 0, last = performance.now();
+const boat = { x: 0, y: 0, vx: 0, vy: 0, heading: 0 };
+let pads = [];
+let mode = 'idle';        // idle | drag | draw | follow
+let grab = { x: 0, y: 0 };
+let drawPts = [];
+let follow = null;        // {pts, cum, L, t0, dur}
+const keys = new Set();
+const ARROWS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+const FLOWER_COLS = ['#ffc2dd', '#ff9ec7', '#f9a8d4'];
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const smooth = u => u * u * (3 - 2 * u);
+const easeOutCubic = u => 1 - Math.pow(1 - u, 3);
+function wrapAxis(v, size, m) { if (v < -m) return size + m; if (v > size + m) return -m; return v; }
+
+function pointAt(f, s) {
+  const c = f.cum; let i = 1;
+  while (i < c.length - 1 && c[i] < s) i++;
+  const a = f.pts[i - 1], b = f.pts[i];
+  const seg = (c[i] - c[i - 1]) || 1;
+  const k = clamp((s - c[i - 1]) / seg, 0, 1);
+  return { x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k, ang: Math.atan2(b.y - a.y, b.x - a.x) };
+}
+
+// ---------- layout ----------
+function layout() {
+  W = innerWidth; H = innerHeight;
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  boat.x = Math.max(BOAT_R + 30, W * 0.12);          // bottom-left corner
+  boat.y = H - Math.max(BOAT_R + 30, H * 0.12);
+  boat.vx = boat.vy = 0; mode = 'idle'; follow = null; drawPts = [];
+  makePads();
+}
+
+function makePads() {
+  pads = [];
+  const target = Math.min(70, Math.round(W * H / 13000));
+  for (let tries = 0; pads.length < target && tries < 3000; tries++) {
+    const r = 20 + Math.random() * 14;
+    const x = r + Math.random() * (W - 2 * r), y = r + Math.random() * (H - 2 * r);
+    if (Math.hypot(x - boat.x, y - boat.y) < 170) continue;
+    if (pads.some(p => Math.hypot(p.x - x, p.y - y) < p.r + r + 18)) continue;
+    pads.push({
+      x, y, r, rot: Math.random() * TAU, ph: Math.random() * TAU,
+      lotus: Math.random() < 0.45, col: FLOWER_COLS[Math.floor(Math.random() * 3)],
+      push: null, near: false
+    });
+  }
+}
+
+// ---------- physics ----------
+function startPush(p, nx, ny, dist) {
+  p.push = {
+    x0: p.x, y0: p.y,
+    x1: clamp(p.x + nx * dist, p.r, W - p.r),
+    y1: clamp(p.y + ny * dist, p.r, H - p.r),
+    t0: time
+  };
+}
+
+function collide() {
+  for (const p of pads) {
+    const dx = p.x - boat.x, dy = p.y - boat.y, d = Math.hypot(dx, dy) || 0.001;
+    const nx = dx / d, ny = dy / d, hit = BOAT_R + p.r;
+    if (d < hit) {
+      if (!p.push) startPush(p, nx, ny, PUSH_FULL);
+      p.near = true;
+    } else if (d < hit + NEAR_GAP) {
+      if (!p.near && !p.push) startPush(p, nx, ny, PUSH_NEAR);
+      p.near = true;
+    } else {
+      p.near = false;
+    }
+  }
+}
+
+function updatePads() {
+  for (const p of pads) {
+    if (!p.push) continue;
+    const u = clamp((time - p.push.t0) / PUSH_TIME, 0, 1), e = easeOutCubic(u);
+    p.x = p.push.x0 + (p.push.x1 - p.push.x0) * e;
+    p.y = p.push.y0 + (p.push.y1 - p.push.y0) * e;
+    if (u >= 1) p.push = null;
+  }
+}
+
+function updateKeys(dt) {
+  let ax = 0, ay = 0;
+  for (const k of keys) { const d = ARROWS[k]; if (d) { ax += d[0]; ay += d[1]; } }
+  if ((ax || ay) && mode === 'follow') { follow = null; mode = 'idle'; }
+  if (mode !== 'idle') return;
+  if (ax || ay) { const l = Math.hypot(ax, ay); boat.vx += ax / l * ACC * dt; boat.vy += ay / l * ACC * dt; }
+  const sp = Math.hypot(boat.vx, boat.vy);
+  if (sp > MAX_V) { boat.vx *= MAX_V / sp; boat.vy *= MAX_V / sp; }
+  const damp = Math.exp(-FRICTION * dt); boat.vx *= damp; boat.vy *= damp;
+  boat.x += boat.vx * dt; boat.y += boat.vy * dt;
+  if (Math.hypot(boat.vx, boat.vy) > 5) boat.heading = Math.atan2(boat.vy, boat.vx);
+  boat.x = wrapAxis(boat.x, W, WRAP_M);
+  boat.y = wrapAxis(boat.y, H, WRAP_M);
+}
+
+function startFollow() {
+  const pts = drawPts; drawPts = [];
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  const L = cum[cum.length - 1];
+  if (L < 20) { mode = 'idle'; return; }
+  follow = { pts, cum, L, t0: time, dur: Math.max(1.2, L / PATH_SPEED) };
+  mode = 'follow';
+}
+
+function updateFollow() {
+  const f = follow;
+  const u = clamp((time - f.t0) / f.dur, 0, 1);
+  const p = pointAt(f, smooth(u) * f.L);     // ease in + ease out
+  boat.x = p.x; boat.y = p.y; boat.heading = p.ang;
+  if (u >= 1) { follow = null; mode = 'idle'; }
+}
+
+// ---------- input ----------
+const hitBoat = (x, y) => Math.hypot(x - boat.x, y - boat.y) < BOAT_R + 24;
+
+cv.addEventListener('pointerdown', e => {
+  const x = e.clientX, y = e.clientY;
+  follow = null; boat.vx = boat.vy = 0;
+  cv.setPointerCapture(e.pointerId);
+  if (hitBoat(x, y)) { mode = 'drag'; grab = { x: boat.x - x, y: boat.y - y }; }
+  else { mode = 'draw'; drawPts = [{ x: boat.x, y: boat.y }, { x, y }]; }
+});
+
+cv.addEventListener('pointermove', e => {
+  const x = clamp(e.clientX, 0, W), y = clamp(e.clientY, 0, H);
+  if (mode === 'drag') {
+    const nx = clamp(x + grab.x, BOAT_R, W - BOAT_R), ny = clamp(y + grab.y, BOAT_R, H - BOAT_R);
+    const dx = nx - boat.x, dy = ny - boat.y;
+    if (Math.hypot(dx, dy) > 0.5) boat.heading = Math.atan2(dy, dx);
+    boat.x = nx; boat.y = ny;
+  } else if (mode === 'draw') {
+    const l = drawPts[drawPts.length - 1];
+    if (Math.hypot(x - l.x, y - l.y) > 5) drawPts.push({ x, y });
+  }
+});
+
+const endPointer = () => {
+  if (mode === 'draw') startFollow();
+  else if (mode === 'drag') mode = 'idle';
+};
+cv.addEventListener('pointerup', endPointer);
+cv.addEventListener('pointercancel', endPointer);
+
+addEventListener('keydown', e => { if (ARROWS[e.key]) { e.preventDefault(); keys.add(e.key); } });
+addEventListener('keyup', e => keys.delete(e.key));
+addEventListener('blur', () => keys.clear());
+addEventListener('resize', layout);
+
+document.getElementById('soon').addEventListener('click', e => {
+  const b = e.currentTarget; b.classList.add('flash');
+  setTimeout(() => b.classList.remove('flash'), 300);
+});
+
+// ---------- drawing ----------
+function drawWater() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#8ad8fb'); g.addColorStop(1, '#3aa6e4');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+  for (let y0 = -46; y0 < H + 46; y0 += 46) {
+    ctx.beginPath();
+    for (let x = 0; x <= W + 20; x += 20) {
+      const y = y0 + Math.sin(x * 0.012 + time * 1.1 + y0 * 0.03) * 5 + Math.sin(x * 0.004 - time * 0.6) * 4;
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawPath(pts) {
+  ctx.save();
+  ctx.setLineDash([10, 10]); ctx.lineWidth = 3; ctx.lineCap = ctx.lineJoin = 'round';
+  ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+  ctx.beginPath();
+  pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  ctx.stroke(); ctx.restore();
+}
+
+function drawPad(p) {
+  const t = time + p.ph;
+  const x = p.x + Math.sin(t * 0.9) * 1.6, y = p.y + Math.cos(t * 0.7) * 1.6;   // ripple drift
+  ctx.save(); ctx.translate(x, y); ctx.rotate(p.rot + Math.sin(t * 0.5) * 0.04);
+  ctx.fillStyle = 'rgba(0,50,90,0.18)';
+  ctx.beginPath(); ctx.arc(2, 4, p.r, 0, TAU); ctx.fill();
+  const g = ctx.createRadialGradient(0, 0, 2, 0, 0, p.r);
+  g.addColorStop(0, '#8ee07a'); g.addColorStop(1, '#2e8b3e');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, p.r, 0.25, TAU - 0.25); ctx.closePath(); ctx.fill();   // notch
+  ctx.strokeStyle = 'rgba(20,90,40,0.45)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(p.r * 0.85, 0); ctx.stroke();
+  if (p.lotus) {
+    const s = p.r * 0.95;
+    for (let k = 0; k < 7; k++) {
+      ctx.rotate(TAU / 7);
+      ctx.fillStyle = k % 2 ? p.col : '#ffffff';
+      ctx.beginPath(); ctx.ellipse(0, -s * 0.5, s * 0.28, s * 0.5, 0, 0, TAU); ctx.fill();
+    }
+    ctx.fillStyle = '#ffd166';
+    ctx.beginPath(); ctx.arc(0, 0, s * 0.2, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawBoat() {
+  const bob = Math.sin(time * 2.1) * 1.2;
+  ctx.save(); ctx.translate(boat.x, boat.y + bob); ctx.rotate(boat.heading);
+  ctx.fillStyle = 'rgba(0,40,80,0.25)';                       // shadow
+  ctx.beginPath(); ctx.ellipse(5, 8, 80, 34, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#8b4a22';                                   // hull
+  ctx.beginPath(); ctx.ellipse(0, 0, 78, 30, 0, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#4e2411'; ctx.lineWidth = 4; ctx.stroke();
+  const cols = ['#ff9f1c', '#fffaf0', '#4caf50'];             // flower cargo
+  for (let i = 0; i < 14; i++) for (let j = -1; j <= 1; j++) {
+    ctx.fillStyle = cols[(i + j + 3) % 3];
+    ctx.beginPath(); ctx.arc(-48 + i * 7.4, j * 8, 6.5, 0, TAU); ctx.fill();
+  }
+  for (const s of [-1, 1]) {                                   // paddles, stroke forever
+    const ph = s > 0 ? 0 : Math.PI;
+    const sway = Math.sin(time * 3.2 + ph) * 18;
+    const sx = -8, sy = s * 8, ex = sx + sway, ey = sy + s * 30;
+    ctx.strokeStyle = '#c08457'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.fillStyle = '#c08457';
+    ctx.beginPath(); ctx.ellipse(ex, ey, 4, 9, Math.atan2(ey - sy, ex - sx) + Math.PI / 2, 0, TAU); ctx.fill();
+  }
+  ctx.fillStyle = '#2563eb';                                   // boatman
+  ctx.beginPath(); ctx.ellipse(-8, 0, 10, 9, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#d9a06f';
+  ctx.beginPath(); ctx.arc(-8, 0, 6, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#1f1f1f';
+  ctx.beginPath(); ctx.arc(-9, 0, 3.5, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+// ---------- loop ----------
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now; time += dt;
+  updateKeys(dt);
+  if (mode === 'follow') updateFollow();
+  updatePads();
+  collide();
+  drawWater();
+  if (mode === 'draw') drawPath(drawPts);
+  if (mode === 'follow') drawPath(follow.pts);
+  for (const p of pads) drawPad(p);
+  drawBoat();
+  requestAnimationFrame(frame);
+}
+
+// ---------- self-check: open with ?check ----------
+if (location.search.includes('check')) {
+  console.assert(smooth(0) === 0 && smooth(1) === 1 && smooth(0.5) === 0.5, 'smooth');
+  console.assert(wrapAxis(-100, 800, 70) === 870, 'wrap low');
+  console.assert(wrapAxis(900, 800, 70) === -70, 'wrap high');
+  const f = { pts: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }], cum: [0, 100, 200] };
+  const p = pointAt(f, 150);
+  console.assert(p.x === 100 && p.y === 50, 'pointAt');
+  console.log('lotus-boat self-check ran');
+}
+
+layout();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>
