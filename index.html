@@ -107,8 +107,20 @@ function bake(im, s, blur = 7, alpha = 0.35) {
   });
 }
 
+// sprite + separate blurred silhouette, so the shadow can sit at a fixed world offset (sun stays put
+// while pads rotate). Silhouette trick: draw the sprite off-canvas, let only its shadow land inside.
+function bakeSplit(im, s, blur = 6, color = 'rgba(4,22,55,0.6)') {
+  const pad = blur * 2, w = im.width * s + pad * 2, h = im.height * s + pad * 2, far = 10000;
+  const b = offscreen(w, h, g => g.drawImage(im, pad, pad, im.width * s, im.height * s));
+  b.sh = offscreen(w, h, g => {
+    g.shadowColor = color; g.shadowBlur = blur * DPR; g.shadowOffsetX = far * DPR;
+    g.drawImage(im, pad - far, pad, im.width * s, im.height * s);
+  }).c;
+  return b;
+}
+
 function bakeAll() {
-  for (const n of SPRITES) if (/^(lotus|pad)/.test(n)) baked[n] = bake(img[n], k);
+  for (const n of SPRITES) if (/^(lotus|pad)/.test(n)) baked[n] = bakeSplit(img[n], k);
   const s = k, hw = img.hull.width * s, hh = img.hull.height * s, pad = 24;
   boatBase = offscreen(hw + pad * 2, hh + pad * 2, g => {
     g.translate(pad + hw / 2, pad + hh / 2); g.scale(s, s);
@@ -133,8 +145,8 @@ function bakeAll() {
 // Each band has a sharp bright edge and a grainy fade behind it, drawn as stipple
 // (pixel is white with probability = band strength), like the reference texture.
 const WAVE_LAYERS = [
-  { f: [1, 2], w1: [1, 0, 2.2], w2: [2, 1, 0.5], edge: 0.16, fade: 0.62, dens: 0.92, speck: 0.06, a: 165, vel: [1, 1] },
-  { f: [2, 3], w1: [1, 1, 1.8], w2: [3, 0, 0.5], edge: 0.1, fade: 0.3, dens: 0.4, speck: 0, a: 60, vel: [0.45, -0.3] },
+  { f: [1, 2], w1: [1, 0, 2.2], w2: [2, 1, 0.5], edge: 0.16, fade: 0.62, dens: 0.92, speck: 0.06, a: 75, vel: [1, 1] },
+  { f: [2, 3], w1: [1, 1, 1.8], w2: [3, 0, 0.5], edge: 0.1, fade: 0.3, dens: 0.4, speck: 0, a: 28, vel: [0.45, -0.3] },
 ];
 
 function makeWaves() {
@@ -432,9 +444,9 @@ function drawLine(pts, dash) {
   ctx.restore();
 }
 
-function drawBaked(b, x, y, rot, s = 1) {
+function drawBaked(b, x, y, rot, s = 1, shadow = false) {
   ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
-  ctx.drawImage(b.c, -b.w * s / 2, -b.h * s / 2, b.w * s, b.h * s);
+  ctx.drawImage(shadow ? b.sh : b.c, -b.w * s / 2, -b.h * s / 2, b.w * s, b.h * s);
   ctx.restore();
 }
 
@@ -442,8 +454,13 @@ function drawItem(p) {
   const t = time + p.ph;
   const x = p.x + Math.sin(t * 0.8) * 1.5, y = p.y + Math.cos(t * 0.6) * 1.5;   // ripple bob
   const rot = p.rot + Math.sin(t * 0.5) * 0.05;
+  const fr = Math.sin(t * 0.5) * 0.05, sx = 3 * k, sy = 6 * k;     // shadow offset: light from top-left
+  drawBaked(baked[p.sprite], x + sx, y + sy, rot, p.s, true);
   drawBaked(baked[p.sprite], x, y, rot, p.s);
-  if (p.flower) drawBaked(baked[p.flower], x - 3 * k, y - 3 * k, Math.sin(t * 0.5) * 0.05, 0.62);
+  if (p.flower) {
+    drawBaked(baked[p.flower], x - 3 * k + sx * 0.6, y - 3 * k + sy * 0.6, fr, 0.62, true);
+    drawBaked(baked[p.flower], x - 3 * k, y - 3 * k, fr, 0.62);
+  }
 }
 
 // arm sprite (sleeve + fist) stretched from shoulder so the fist lands on the hand point
