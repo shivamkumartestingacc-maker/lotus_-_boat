@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Lotus Boat</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #2468b3; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #7fc0ef; }
   canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
   .glass {
     position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 28px);
@@ -141,12 +141,10 @@ function bakeAll() {
 
 // ---------- waves: 3 layers of curvy oval bands, periodic in x and y so each can drift any way ----------
 // integer frequencies keep every term periodic over the tile
-// S-curved bands rising bottom-left to top-right: phase grows down/right, a sine along x bends each band.
-// Each band has a sharp bright edge and a grainy fade behind it, drawn as stipple
-// (pixel is white with probability = band strength), like the reference texture.
 const WAVE_LAYERS = [
-  { f: [1, 2], w1: [1, 0, 2.2], w2: [2, 1, 0.5], edge: 0.16, fade: 0.62, dens: 0.92, speck: 0.06, a: 75, vel: [1, 1] },
-  { f: [2, 3], w1: [1, 1, 1.8], w2: [3, 0, 0.5], edge: 0.1, fade: 0.3, dens: 0.4, speck: 0, a: 28, vel: [0.45, -0.3] },
+  { f: [2, 1], w1: [1, 2, 2.2], w2: [3, -1, 1.4], br: [2, 3], thr: 0.64, soft: 0.22, a: 95, vel: [1, 1] },
+  { f: [3, -1], w1: [2, 1, 1.8], w2: [1, 3, 1.6], br: [3, 1], thr: 0.7, soft: 0.2, a: 70, vel: [0.55, -0.35] },
+  { f: [1, 2], w1: [3, 1, 2.0], w2: [2, -3, 1.2], br: [1, 4], thr: 0.72, soft: 0.18, a: 55, vel: [-0.3, 0.6] },
 ];
 
 function makeWaves() {
@@ -157,12 +155,12 @@ function makeWaves() {
     for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
       const u = x / tw, v = y / th;
       const warp = L.w1[2] * Math.sin(TAU * (L.w1[0] * u + L.w1[1] * v)) + L.w2[2] * Math.sin(TAU * (L.w2[0] * u + L.w2[1] * v) + 1.3);
-      const ph = (L.f[0] * u + L.f[1] * v) + warp / TAU;
-      const t = ph - Math.floor(ph);                                  // 0..1 across one band period
-      const band = t < L.edge ? smooth(t / L.edge) : Math.max(0, 1 - (t - L.edge) / L.fade) ** 1.6;
-      if (Math.random() >= band * L.dens + L.speck) continue;
+      const wave = Math.sin(TAU * (L.f[0] * u + L.f[1] * v) + warp);
+      const breakup = 0.6 + 0.4 * Math.sin(TAU * (L.br[0] * u - L.br[1] * v));   // cuts bands into ovals
+      const n = (Math.random() - 0.5) * 0.38;
+      const band = smooth(clamp(((wave * breakup) * 0.5 + 0.5 + n - L.thr) / L.soft, 0, 1));
       const i = (y * tw + x) * 4;
-      px[i] = px[i + 1] = px[i + 2] = 255; px[i + 3] = L.a;
+      px[i] = px[i + 1] = px[i + 2] = 255; px[i + 3] = band * L.a;
     }
     g.putImageData(d, 0, 0);
     return c;
@@ -428,7 +426,7 @@ document.getElementById('soon').addEventListener('click', e => {
 // ---------- drawing ----------
 function drawWater() {
   const g = ctx.createLinearGradient(0, 0, W, H);
-  g.addColorStop(0, '#2c7bc6'); g.addColorStop(1, '#1b5aa3');
+  g.addColorStop(0, '#8fcbf4'); g.addColorStop(1, '#6db3ea');
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
   waveLayers.forEach((c, i) => {
     const v = WAVE_LAYERS[i].vel;
