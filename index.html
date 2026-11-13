@@ -30,15 +30,26 @@ const cv = document.getElementById('pond');
 const ctx = cv.getContext('2d');
 const TAU = Math.PI * 2;
 
-// ---------- tuning ----------
+// ---------- tuning (px and seconds at k = 1; k scales with screen) ----------
 const HULL_A = 122, HULL_B = 31;  // hull half-length / half-width, sprite px (collider ellipse)
-const PUSH_FULL = 60;             // px pad slides on contact (scaled by k)
+const PUSH_FULL = 60;             // px pad slides on contact
 const PUSH_NEAR = 10;             // px pad slides when boat brushes past
 const NEAR_GAP = 26;              // px around hull that counts as "brush"
 const PUSH_TIME = 1.0;            // s ease-out slide
-const PATH_SPEED = 160;           // px/s along drawn path
-const ACC = 700, MAX_V = 280, FRICTION = 1.2;   // arrow keys: thrust, cap, inertia decay
-const STROKE_HZ = 0.55;           // paddle strokes per second
+
+// boat physics: one model, every control (keys, drag, path) only sets heading + throttle
+const THRUST = 110;               // px/s^2 at full throttle
+const DRAG_FWD = 0.55;            // 1/s water drag along the keel: low = long glide (inertia)
+const DRAG_SIDE = 3.5;            // 1/s drag across the keel: boats don't slide sideways
+const TURN_MIN = 0.3;             // rad/s max turn when nearly stopped
+const TURN_GAIN = 0.9;            // extra rad/s max turn at cruising speed
+const TURN_RESP = 2.2;            // 1/s how fast turn rate builds (angular inertia)
+const CRUISE = 170;               // px/s speed used to scale turning
+const V_PATH = 150;               // px/s top speed when following a path
+const TOW_K = 3.0, TOW_D = 1.4;   // drag rope: spring 1/s^2, damper 1/s (some overshoot, like a towed hull)
+const TOW_MAX = 520;              // px/s^2 strongest pull
+const LOOKAHEAD = 70;             // px path pure-pursuit lookahead
+const FLOW = { x: 14, y: 6 };     // px/s water current, same direction as the main wave layer
 
 const SPRITES = ['hull', 'paddle', 'body', 'arm', 'cargo_o', 'cargo_w', 'cargo_g',
   'lotus1', 'lotus2', 'lotus3', 'lotus4', 'lotus5', 'lotus6', 'lotus7', 'lotus8',
@@ -46,13 +57,13 @@ const SPRITES = ['hull', 'paddle', 'body', 'arm', 'cargo_o', 'cargo_w', 'cargo_g
 const img = {};
 
 let W = 0, H = 0, DPR = 1, k = 1, time = 0, last = 0, ready = false;
-const boat = { x: 0, y: 0, vx: 0, vy: 0, heading: -0.3, px: 0, py: 0, mvx: 0, mvy: 0 };
-let items = [];
+const boat = { x: 0, y: 0, vx: 0, vy: 0, heading: -0.3, w: 0, throttle: 0, stroke: 0 };
+let items = [], ripples = [], nextRipple = 0;
 let mode = 'idle';        // idle | drag | draw | follow
-let grab = { x: 0, y: 0 };
+let grab = { x: 0, y: 0 }, dragT = { x: 0, y: 0 };
 let drawPts = [];
 let follow = null;
-let waveTile = null, boatBase = null, bodyBaked = null;
+let waveLayers = [], boatBase = null, bodyBaked = null;
 const baked = {};
 const keys = new Set();
 const ARROWS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
@@ -60,6 +71,7 @@ const ARROWS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], Arrow
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const smooth = u => u * u * (3 - 2 * u);
 const easeOutCubic = u => 1 - Math.pow(1 - u, 3);
+const angDiff = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
 const pick = a => a[Math.floor(Math.random() * a.length)];
 function wrapAxis(v, size, m) { if (v < -m) return size + m; if (v > size + m) return -m; return v; }
 
@@ -67,8 +79,8 @@ function pointAt(f, s) {
   const c = f.cum; let i = 1;
   while (i < c.length - 1 && c[i] < s) i++;
   const a = f.pts[i - 1], b = f.pts[i];
-  const k2 = clamp((s - c[i - 1]) / ((c[i] - c[i - 1]) || 1), 0, 1);
-  return { x: a.x + (b.x - a.x) * k2, y: a.y + (b.y - a.y) * k2, ang: Math.atan2(b.y - a.y, b.x - a.x) };
+  const t = clamp((s - c[i - 1]) / ((c[i] - c[i - 1]) || 1), 0, 1);
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
 }
 
 // ---------- assets ----------
@@ -79,7 +91,6 @@ function load() {
   })));
 }
 
-// draw fn into an offscreen canvas of css size w x h, at device resolution
 function offscreen(w, h, fn) {
   const c = document.createElement('canvas');
   c.width = Math.ceil(w * DPR); c.height = Math.ceil(h * DPR);
@@ -98,7 +109,6 @@ function bake(im, s, blur = 7, alpha = 0.35) {
 
 function bakeAll() {
   for (const n of SPRITES) if (/^(lotus|pad)/.test(n)) baked[n] = bake(img[n], k);
-  // hull + flower cargo, one sprite with a blue glow like the reference
   const s = k, hw = img.hull.width * s, hh = img.hull.height * s, pad = 24;
   boatBase = offscreen(hw + pad * 2, hh + pad * 2, g => {
     g.translate(pad + hw / 2, pad + hh / 2); g.scale(s, s);
@@ -117,21 +127,43 @@ function bakeAll() {
   bodyBaked = bake(img.body, k * 0.9, 5, 0.45);
 }
 
-// grainy white diagonal bands, tileable on x, rendered once per resize
+// ---------- waves: 3 layers of curvy oval bands, periodic in x and y so each can drift any way ----------
+// integer frequencies keep every term periodic over the tile
+const WAVE_LAYERS = [
+  { f: [2, 1], w1: [1, 2, 2.2], w2: [3, -1, 1.4], br: [2, 3], thr: 0.64, soft: 0.22, a: 95, vel: [1, 1] },
+  { f: [3, -1], w1: [2, 1, 1.8], w2: [1, 3, 1.6], br: [3, 1], thr: 0.7, soft: 0.2, a: 70, vel: [0.55, -0.35] },
+  { f: [1, 2], w1: [3, 1, 2.0], w2: [2, -3, 1.2], br: [1, 4], thr: 0.72, soft: 0.18, a: 55, vel: [-0.3, 0.6] },
+];
+
 function makeWaves() {
   const tw = Math.ceil(W), th = Math.ceil(H);
-  const c = document.createElement('canvas'); c.width = tw; c.height = th;
-  const g = c.getContext('2d'), d = g.createImageData(tw, th), px = d.data;
-  for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
-    const u = x / tw, v = y / th;
-    const ph = TAU * (3 * u + 1.2 * v) + 2.6 * Math.sin(TAU * (u + 0.5 * v));
-    const n = (Math.random() - 0.5) * 0.4;
-    const band = smooth(clamp((Math.sin(ph) * 0.5 + 0.5 + n - 0.66) / 0.24, 0, 1));
-    const i = (y * tw + x) * 4;
-    px[i] = px[i + 1] = px[i + 2] = 255; px[i + 3] = band * 105;
-  }
-  g.putImageData(d, 0, 0);
-  waveTile = c;
+  waveLayers = WAVE_LAYERS.map(L => {
+    const c = document.createElement('canvas'); c.width = tw; c.height = th;
+    const g = c.getContext('2d'), d = g.createImageData(tw, th), px = d.data;
+    for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
+      const u = x / tw, v = y / th;
+      const warp = L.w1[2] * Math.sin(TAU * (L.w1[0] * u + L.w1[1] * v)) + L.w2[2] * Math.sin(TAU * (L.w2[0] * u + L.w2[1] * v) + 1.3);
+      const wave = Math.sin(TAU * (L.f[0] * u + L.f[1] * v) + warp);
+      const breakup = 0.6 + 0.4 * Math.sin(TAU * (L.br[0] * u - L.br[1] * v));   // cuts bands into ovals
+      const n = (Math.random() - 0.5) * 0.38;
+      const band = smooth(clamp(((wave * breakup) * 0.5 + 0.5 + n - L.thr) / L.soft, 0, 1));
+      const i = (y * tw + x) * 4;
+      px[i] = px[i + 1] = px[i + 2] = 255; px[i + 3] = band * L.a;
+    }
+    g.putImageData(d, 0, 0);
+    return c;
+  });
+}
+
+function drawTiled(c, ox, oy) {
+  ox = ((ox % W) + W) % W; oy = ((oy % H) + H) % H;
+  for (const x of [ox - W, ox]) for (const y of [oy - H, oy]) ctx.drawImage(c, x, y, W, H);
+}
+
+// water current at a point: main flow + slow swirl, so riding the flow is faster than fighting it
+function current(x, y) {
+  const s = 0.7 + 0.3 * Math.sin(x * 0.004 + time * 0.25) * Math.cos(y * 0.005 - time * 0.2);
+  return { x: FLOW.x * k * s, y: FLOW.y * k * s };
 }
 
 // ---------- layout ----------
@@ -144,68 +176,142 @@ function layout() {
   if (!ready) return;
   bakeAll();
   boat.x = HULL_A * k + 20; boat.y = H - HULL_B * k - 70;      // bottom-left corner
-  boat.heading = -0.3; boat.vx = boat.vy = 0; boat.px = boat.x; boat.py = boat.y;
-  mode = 'idle'; follow = null; drawPts = [];
+  boat.heading = -0.3; boat.vx = boat.vy = boat.w = 0;
+  mode = 'idle'; follow = null; drawPts = []; ripples = [];
   makeItems();
 }
 
 function addItem(type, x, y) {
-  const r = type === 'big' ? pick(['pad3', 'pad6']) : type === 'lotus' ? pick(['lotus3', 'lotus4', 'lotus5', 'lotus6', 'lotus7', 'lotus8'])
-          : pick(['pad1', 'pad2', 'pad4', 'pad5', 'pad8']);
-  const s = type === 'dot' ? 0.3 + Math.random() * 0.12 : type === 'pad' ? 0.7 + Math.random() * 0.25 : type === 'lotus' ? 0.6 + Math.random() * 0.15 : 1.15;
-  const sprite = type === 'dot' ? 'pad7' : r;
+  const sprite = type === 'dot' ? 'pad7'
+    : type === 'big' ? pick(['pad3', 'pad6'])
+    : type === 'lotus' ? pick(['lotus3', 'lotus4', 'lotus5', 'lotus6', 'lotus7', 'lotus8'])
+    : pick(['pad1', 'pad2', 'pad4', 'pad5', 'pad8']);
+  const s = type === 'dot' ? 0.3 + Math.random() * 0.12 : type === 'pad' ? 0.65 + Math.random() * 0.3
+          : type === 'lotus' ? 0.55 + Math.random() * 0.2 : 1.1 + Math.random() * 0.15;
   const im = img[sprite];
-  const it = {
+  items.push({
     type, sprite, s, x, y, r: Math.max(im.width, im.height) * 0.5 * k * s * 0.9,
     rot: type === 'lotus' ? (Math.random() - 0.5) * 0.6 : Math.random() * TAU,
     flower: type === 'big' ? pick(['lotus1', 'lotus2']) : null,
     ph: Math.random() * TAU, push: null, near: false
-  };
-  items.push(it);
-  return it;
+  });
 }
 
 function free(x, y, r) {
-  if (Math.hypot(x - boat.x, y - boat.y) < HULL_A * k + 60) return false;
-  return !items.some(p => Math.hypot(p.x - x, p.y - y) < p.r + r + 12);
+  if (Math.hypot(x - boat.x, y - boat.y) < HULL_A * k + 50) return false;
+  return !items.some(p => Math.hypot(p.x - x, p.y - y) < p.r + r + 6);
 }
 
 function makeItems() {
   items = [];
   const m = 50 * k;
   [[m, m], [W - m, m], [W - m, H - m - 60]].forEach(([x, y]) => addItem('big', x, y));   // corners, like reference
-  const n = Math.min(55, Math.round(W * H / 17000));
-  for (let tries = 0; items.length < n && tries < 4000; tries++) {
+  const n = Math.min(120, Math.round(W * H / 8500));
+  for (let tries = 0; items.length < n && tries < 6000; tries++) {
     const roll = Math.random();
-    const type = roll < 0.05 ? 'big' : roll < 0.3 ? 'lotus' : roll < 0.68 ? 'pad' : 'dot';
-    const r = (type === 'big' ? 38 : type === 'dot' ? 6 : 22) * k;
+    const type = roll < 0.06 ? 'big' : roll < 0.36 ? 'lotus' : roll < 0.74 ? 'pad' : 'dot';
+    const r = (type === 'big' ? 38 : type === 'dot' ? 6 : 18) * k;
     const x = r + Math.random() * (W - 2 * r), y = r + Math.random() * (H - 2 * r);
     if (free(x, y, r)) addItem(type, x, y);
   }
 }
 
-// ---------- physics ----------
+// ---------- boat physics ----------
+// steer = { heading: target angle or null, throttle: 0..~1.4 }
+function stepBoat(dt, steer) {
+  const c = current(boat.x, boat.y);
+  const ch = Math.cos(boat.heading), sh = Math.sin(boat.heading);
+  const rx = boat.vx - c.x, ry = boat.vy - c.y;                // velocity relative to the water
+  const fwd = rx * ch + ry * sh, side = -rx * sh + ry * ch;
+  let aF = -DRAG_FWD * fwd, aS = -DRAG_SIDE * side;
+  let wTarget = 0;
+  if (steer.heading != null) {
+    const err = angDiff(steer.heading, boat.heading);
+    const wMax = (TURN_MIN + TURN_GAIN * Math.min(1, Math.abs(fwd) / (CRUISE * k))) * (steer.turnBoost || 1);
+    wTarget = clamp(err * 1.8, -wMax, wMax);
+    // thrust mostly when pointing the right way: a reversal becomes a wide arc, never a spin
+    aF += THRUST * k * steer.throttle * (0.25 + 0.75 * Math.max(0, Math.cos(err)));
+  }
+  boat.w += (wTarget - boat.w) * Math.min(1, TURN_RESP * dt);
+  boat.heading += boat.w * dt;
+  boat.vx += (aF * ch - aS * sh) * dt;
+  boat.vy += (aF * sh + aS * ch) * dt;
+  if (steer.tow) { boat.vx += steer.tow.x * dt; boat.vy += steer.tow.y * dt; }
+  boat.x += boat.vx * dt; boat.y += boat.vy * dt;
+  boat.throttle += ((steer.heading != null ? steer.throttle : 0) - boat.throttle) * Math.min(1, 3 * dt);
+}
+
+const fwdSpeed = () => boat.vx * Math.cos(boat.heading) + boat.vy * Math.sin(boat.heading);
+// throttle that eases toward a wanted speed: soft start, soft arrival
+const throttleFor = (want, cap = 1) => clamp((want - fwdSpeed()) / (40 * k), 0, cap);
+
+function pilotKeys() {
+  let ax = 0, ay = 0;
+  for (const kk of keys) { const d = ARROWS[kk]; if (d) { ax += d[0]; ay += d[1]; } }
+  if (!ax && !ay) return { heading: null, throttle: 0 };
+  return { heading: Math.atan2(ay, ax), throttle: 1 };
+}
+
+// towing: finger is a spring-damper rope on the boat. Mass lags, keel turns it to follow the rope,
+// momentum carries it past the finger and on after release.
+function pilotDrag() {
+  const dx = dragT.x - boat.x, dy = dragT.y - boat.y, d = Math.hypot(dx, dy);
+  let tx = dx * TOW_K - boat.vx * TOW_D, ty = dy * TOW_K - boat.vy * TOW_D;
+  const tl = Math.hypot(tx, ty), cap = TOW_MAX * k;
+  if (tl > cap) { tx *= cap / tl; ty *= cap / tl; }
+  return { heading: d > 18 * k ? Math.atan2(dy, dx) : null, throttle: 0.4, turnBoost: 1.8, tow: { x: tx, y: ty } };
+}
+
+function pilotPath() {
+  const f = follow;
+  let best = f.s, bd = Infinity;                                // project boat onto path, forward only
+  for (let s = f.s; s <= Math.min(f.L, f.s + 160 * k); s += 4) {
+    const p = pointAt(f, s), d = (p.x - boat.x) ** 2 + (p.y - boat.y) ** 2;
+    if (d < bd) { bd = d; best = s; }
+  }
+  f.s = best;
+  const remain = f.L - f.s;
+  if ((remain < 14 * k && Math.hypot(boat.vx, boat.vy) < 30 * k) || time - f.t0 > f.timeout) {
+    follow = null; mode = 'idle'; return { heading: null, throttle: 0 };
+  }
+  const t = pointAt(f, Math.min(f.L, f.s + LOOKAHEAD * k));
+  const heading = Math.atan2(t.y - boat.y, t.x - boat.x);
+  const bend = 0.35 + 0.65 * Math.max(0, Math.cos(angDiff(heading, boat.heading)));   // ease off into bends
+  return { heading, throttle: throttleFor(Math.min(V_PATH * k * bend, 20 * k + remain * 0.8)) };
+}
+
+function startFollow() {
+  const pts = drawPts; drawPts = [];
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  const L = cum[cum.length - 1];
+  if (L < 20) { mode = 'idle'; return; }
+  follow = { pts, cum, L, s: 0, t0: time, timeout: 4 + 3 * L / (V_PATH * k) };
+  mode = 'follow';
+}
+
+// ---------- pads ----------
 function startPush(p, nx, ny, dist) {
   p.push = { x0: p.x, y0: p.y, x1: clamp(p.x + nx * dist, p.r, W - p.r), y1: clamp(p.y + ny * dist, p.r, H - p.r), t0: time };
 }
 
 function collide() {
   const c = Math.cos(boat.heading), s = Math.sin(boat.heading);
-  const sp = Math.hypot(boat.mvx, boat.mvy), vx = sp > 1 ? boat.mvx / sp : 0, vy = sp > 1 ? boat.mvy / sp : 0;
+  const sp = Math.hypot(boat.vx, boat.vy), vx = sp > 1 ? boat.vx / sp : 0, vy = sp > 1 ? boat.vy / sp : 0;
   const a = HULL_A * k, b = HULL_B * k, gap = NEAR_GAP * k;
   for (const p of items) {
     const dx = p.x - boat.x, dy = p.y - boat.y;
-    const lx = dx * c + dy * s, ly = -dx * s + dy * c;          // boat-local
+    const lx = dx * c + dy * s, ly = -dx * s + dy * c;
     const A = a + p.r, B = b + p.r;
     const inHit = (lx / A) ** 2 + (ly / B) ** 2 < 1;
     const inNear = (lx / (A + gap)) ** 2 + (ly / (B + gap)) ** 2 < 1;
     if (!inNear) { p.near = false; continue; }
-    // ellipse normal, rotated to world, blended with boat motion = "direction of the hit"
     const nlx = lx / (A * A), nly = ly / (B * B);
     let nx = nlx * c - nly * s, ny = nlx * s + nly * c;
     const nl = Math.hypot(nx, ny) || 1; nx = nx / nl + vx * 0.6; ny = ny / nl + vy * 0.6;
     const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
-    if (inHit) { if (!p.push) startPush(p, nx, ny, PUSH_FULL * k); }
+    const hit = Math.min(1.4, 0.5 + sp / (CRUISE * k));        // faster boat, harder shove
+    if (inHit) { if (!p.push) startPush(p, nx, ny, PUSH_FULL * k * hit); }
     else if (!p.near && !p.push) startPush(p, nx, ny, PUSH_NEAR * k);
     p.near = true;
   }
@@ -221,43 +327,45 @@ function updateItems() {
   }
 }
 
-function updateKeys(dt) {
-  let ax = 0, ay = 0;
-  for (const kk of keys) { const d = ARROWS[kk]; if (d) { ax += d[0]; ay += d[1]; } }
-  if ((ax || ay) && mode === 'follow') { follow = null; mode = 'idle'; }
-  if (mode !== 'idle') return;
-  if (ax || ay) { const l = Math.hypot(ax, ay); boat.vx += ax / l * ACC * dt; boat.vy += ay / l * ACC * dt; }
+// ---------- ripples: oval rings shed by the hull + small rings at each paddle stroke ----------
+function paddleGeom() {
+  const ang = Math.PI / 2 - 0.05 + 0.3 * Math.sin(boat.stroke);
+  const dx = Math.cos(ang), dy = Math.sin(ang);
+  const P = { x: -58, y: 27 }, pl = img.paddle.width * 0.78, pivotAt = 0.4;
+  return {
+    ang, pl,
+    G: { x: P.x - dx * pl * pivotAt, y: P.y - dy * pl * pivotAt },
+    H2: { x: P.x - dx * pl * 0.12, y: P.y - dy * pl * 0.12 },
+    tip: { x: P.x + dx * pl * (1 - pivotAt) * 0.85, y: P.y + dy * pl * (1 - pivotAt) * 0.85 },
+  };
+}
+
+function updateRipples(dt) {
   const sp = Math.hypot(boat.vx, boat.vy);
-  if (sp > MAX_V) { boat.vx *= MAX_V / sp; boat.vy *= MAX_V / sp; }
-  const damp = Math.exp(-FRICTION * dt); boat.vx *= damp; boat.vy *= damp;
-  boat.x += boat.vx * dt; boat.y += boat.vy * dt;
-  if (sp > 8) turnTo(Math.atan2(boat.vy, boat.vx), dt);
-  const m = HULL_A * k + 20;
-  boat.x = wrapAxis(boat.x, W, m); boat.y = wrapAxis(boat.y, H, m);
+  if (time >= nextRipple) {
+    ripples.push({ x: boat.x, y: boat.y, ang: boat.heading, t0: time, life: 2.6, a: HULL_A * k * 0.95, b: HULL_B * k * 1.25 });
+    nextRipple = time + (sp > 25 * k ? 0.45 : 1.6);
+  }
+  const before = boat.stroke;
+  boat.stroke += TAU * (0.3 + 0.5 * boat.throttle) * dt;
+  if (Math.floor(before / TAU) !== Math.floor(boat.stroke / TAU)) {              // blade enters water
+    const t = paddleGeom().tip, c = Math.cos(boat.heading), s = Math.sin(boat.heading);
+    ripples.push({ x: boat.x + (t.x * c - t.y * s) * k, y: boat.y + (t.x * s + t.y * c) * k, ang: boat.heading, t0: time, life: 1.4, a: 9 * k, b: 6 * k });
+  }
+  ripples = ripples.filter(r => time - r.t0 < r.life).slice(-40);
 }
 
-// boats don't snap their heading; turn toward target
-function turnTo(target, dt, rate = 5) {
-  let d = target - boat.heading;
-  d = Math.atan2(Math.sin(d), Math.cos(d));
-  boat.heading += d * Math.min(1, rate * dt);
-}
-
-function startFollow() {
-  const pts = drawPts; drawPts = [];
-  const cum = [0];
-  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
-  const L = cum[cum.length - 1];
-  if (L < 20) { mode = 'idle'; return; }
-  follow = { pts, cum, L, t0: time, dur: Math.max(1.4, L / PATH_SPEED) };
-  mode = 'follow';
-}
-
-function updateFollow(dt) {
-  const f = follow, u = clamp((time - f.t0) / f.dur, 0, 1);
-  const p = pointAt(f, smooth(u) * f.L);                        // ease in + ease out
-  boat.x = p.x; boat.y = p.y; turnTo(p.ang, dt, 6);
-  if (u >= 1) { follow = null; mode = 'idle'; }
+function drawRipples() {
+  ctx.save();
+  for (const r of ripples) {
+    const u = (time - r.t0) / r.life, grow = 1 + u * 1.1;
+    ctx.globalAlpha = 0.6 * (1 - u) * (1 - u);
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.5 * (1 - u) + 0.6;
+    ctx.beginPath();
+    ctx.ellipse(r.x, r.y, r.a * grow + u * 24 * k, r.b * grow + u * 34 * k, r.ang, 0, TAU);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 // ---------- input ----------
@@ -270,17 +378,16 @@ function onBoat(x, y) {
 cv.addEventListener('pointerdown', e => {
   if (!ready) return;
   const x = e.clientX, y = e.clientY;
-  follow = null; boat.vx = boat.vy = 0;
+  follow = null;
   cv.setPointerCapture(e.pointerId);
-  if (onBoat(x, y)) { mode = 'drag'; grab = { x: boat.x - x, y: boat.y - y }; }
+  if (onBoat(x, y)) { mode = 'drag'; grab = { x: boat.x - x, y: boat.y - y }; dragT = { x: boat.x, y: boat.y }; }
   else { mode = 'draw'; drawPts = [{ x: boat.x, y: boat.y }, { x, y }]; }
 });
 
 cv.addEventListener('pointermove', e => {
   const x = clamp(e.clientX, 0, W), y = clamp(e.clientY, 0, H);
-  if (mode === 'drag') {
-    boat.x = clamp(x + grab.x, 0, W); boat.y = clamp(y + grab.y, 0, H);
-  } else if (mode === 'draw') {
+  if (mode === 'drag') dragT = { x: x + grab.x, y: y + grab.y };
+  else if (mode === 'draw') {
     const l = drawPts[drawPts.length - 1];
     if (Math.hypot(x - l.x, y - l.y) > 5) drawPts.push({ x, y });
   }
@@ -290,7 +397,11 @@ const endPointer = () => { if (mode === 'draw') startFollow(); else if (mode ===
 cv.addEventListener('pointerup', endPointer);
 cv.addEventListener('pointercancel', endPointer);
 
-addEventListener('keydown', e => { if (ARROWS[e.key]) { e.preventDefault(); keys.add(e.key); } });
+addEventListener('keydown', e => {
+  if (!ARROWS[e.key]) return;
+  e.preventDefault(); keys.add(e.key);
+  if (mode === 'follow') { follow = null; mode = 'idle'; }
+});
 addEventListener('keyup', e => keys.delete(e.key));
 addEventListener('blur', () => keys.clear());
 addEventListener('resize', layout);
@@ -305,14 +416,15 @@ function drawWater() {
   const g = ctx.createLinearGradient(0, 0, W, H);
   g.addColorStop(0, '#8fcbf4'); g.addColorStop(1, '#6db3ea');
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-  const off = (time * 12) % W;                                  // slow drift, tile is x-periodic
-  ctx.drawImage(waveTile, -off, 0, W, H);
-  ctx.drawImage(waveTile, W - off, 0, W, H);
+  waveLayers.forEach((c, i) => {
+    const v = WAVE_LAYERS[i].vel;
+    drawTiled(c, time * FLOW.x * k * v[0] * 1.2, time * FLOW.y * k * v[1] * 1.2 + time * 4 * k * v[1]);
+  });
 }
 
-function drawPath(pts) {
+function drawLine(pts, dash) {
   ctx.save();
-  ctx.setLineDash([2, 12]); ctx.lineWidth = 5; ctx.lineCap = ctx.lineJoin = 'round';
+  ctx.setLineDash(dash); ctx.lineWidth = 5; ctx.lineCap = ctx.lineJoin = 'round';
   ctx.strokeStyle = 'rgba(255,255,255,0.85)';
   ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.stroke();
   ctx.restore();
@@ -342,36 +454,23 @@ function limb(sx, sy, hx, hy, flip) {
 }
 
 function drawBoat() {
+  const roll = Math.sin(time * 1.7) * 0.012 - boat.w * 0.03;   // leans a touch into turns
   ctx.save();
   ctx.translate(boat.x, boat.y);
-  ctx.rotate(boat.heading + Math.sin(time * 1.7) * 0.012);
+  ctx.rotate(boat.heading + roll);
   ctx.drawImage(boatBase.c, -boatBase.w / 2, -boatBase.h / 2, boatBase.w, boatBase.h);
-  ctx.scale(k, k);                                              // sprite-px space from here
-
-  // paddle: pivots on the starboard gunwale, blade sweeps bow -> stern, forever
-  const ph = time * TAU * STROKE_HZ;
-  const ang = Math.PI / 2 - 0.05 + 0.3 * Math.sin(ph);          // ~perpendicular to hull, sweeps fore/aft
-  const dx = Math.cos(ang), dy = Math.sin(ang);
-  const P = { x: -58, y: 27 };                                  // pivot on gunwale
-  const pl = img.paddle.width * 0.78, pivotAt = 0.4;           // paddle length, pivot fraction from grip
-  const G = { x: P.x - dx * pl * pivotAt, y: P.y - dy * pl * pivotAt };          // grip end
-  const H2 = { x: P.x - dx * pl * 0.12, y: P.y - dy * pl * 0.12 };              // lower hand
+  ctx.scale(k, k);
+  const pg = paddleGeom();
   ctx.save();
-  ctx.translate(G.x, G.y); ctx.rotate(ang);
+  ctx.translate(pg.G.x, pg.G.y); ctx.rotate(pg.ang);
   ctx.shadowColor = 'rgba(10,50,110,0.4)'; ctx.shadowBlur = 5 * DPR * k; ctx.shadowOffsetY = 2 * DPR * k;
-  ctx.drawImage(img.paddle, 0, -img.paddle.height * 0.78 / 2, pl, img.paddle.height * 0.78);
+  ctx.drawImage(img.paddle, 0, -img.paddle.height * 0.78 / 2, pg.pl, img.paddle.height * 0.78);
   ctx.restore();
-
-  const B = { x: -92, y: 0 };                                   // boatman centre
-  limb(B.x + 4, B.y - 14, G.x, G.y, true);                      // port arm -> grip
-  limb(B.x + 4, B.y + 14, H2.x, H2.y, false);                   // starboard arm -> shaft
-  ctx.restore();
-
-  // body + hat on top, slight lean with the stroke
-  ctx.save();
-  ctx.translate(boat.x, boat.y); ctx.rotate(boat.heading);
-  const lean = Math.sin(ph) * 2.5 * k;
-  ctx.translate(-92 * k + lean, 0);
+  const B = { x: -92, y: 0 };
+  limb(B.x + 4, B.y - 14, pg.G.x, pg.G.y, true);                // port arm -> grip
+  limb(B.x + 4, B.y + 14, pg.H2.x, pg.H2.y, false);             // starboard arm -> shaft
+  ctx.translate(B.x + Math.sin(boat.stroke) * 2.5, 0);          // body leans with the stroke
+  ctx.scale(1 / k, 1 / k);
   ctx.drawImage(bodyBaked.c, -bodyBaked.w / 2, -bodyBaked.h / 2, bodyBaked.w, bodyBaked.h);
   ctx.restore();
 }
@@ -381,16 +480,20 @@ function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000 || 0); last = now; time += dt;
   drawWater();
   if (ready) {
-    updateKeys(dt);
-    if (mode === 'follow') updateFollow(dt);
-    boat.mvx = (boat.x - boat.px) / (dt || 1); boat.mvy = (boat.y - boat.py) / (dt || 1);
-    if (mode === 'drag' && Math.hypot(boat.mvx, boat.mvy) > 30) turnTo(Math.atan2(boat.mvy, boat.mvx), dt, 4);
-    boat.px = boat.x; boat.py = boat.y;
+    const steer = mode === 'drag' ? pilotDrag() : mode === 'follow' ? pilotPath() : pilotKeys();
+    stepBoat(dt, steer);
+    if (mode !== 'drag' && mode !== 'follow') {
+      const m = HULL_A * k + 20;
+      boat.x = wrapAxis(boat.x, W, m); boat.y = wrapAxis(boat.y, H, m);
+    }
+    updateRipples(dt);
     updateItems();
     collide();
-    if (mode === 'draw') drawPath(drawPts);
-    if (mode === 'follow') drawPath(follow.pts);
+    drawRipples();
+    if (mode === 'draw') drawLine(drawPts, [2, 12]);
+    if (mode === 'follow') drawLine(follow.pts, [2, 12]);
     for (const p of items) drawItem(p);
+    if (mode === 'drag') drawLine([{ x: boat.x, y: boat.y }, dragT], [1, 9]);   // tow line
     drawBoat();
   }
   requestAnimationFrame(frame);
@@ -402,7 +505,14 @@ if (location.search.includes('check')) {
   console.assert(wrapAxis(-100, 800, 70) === 870 && wrapAxis(900, 800, 70) === -70, 'wrap');
   const p = pointAt({ pts: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }], cum: [0, 100, 200] }, 150);
   console.assert(p.x === 100 && p.y === 50, 'pointAt');
-  console.log('lotus-boat self-check ran');
+  console.assert(Math.abs(angDiff(-3, 3) - (TAU - 6)) < 1e-9, 'angDiff wraps');
+  // physics: a 180-degree key reversal must arc, not spin in place
+  k = 1; W = H = 10000; Object.assign(boat, { x: 5000, y: 5000, vx: 150, vy: 0, heading: 0, w: 0 });
+  let maxW = 0, maxYabs = 0;
+  for (let i = 0; i < 300; i++) { stepBoat(1 / 60, { heading: Math.PI, throttle: 1 }); maxW = Math.max(maxW, Math.abs(boat.w)); maxYabs = Math.max(maxYabs, Math.abs(boat.y - 5000)); }
+  console.assert(maxW <= TURN_MIN + TURN_GAIN + 1e-9, 'turn rate capped');
+  console.assert(maxYabs > 40, 'reversal sweeps a wide arc, got ' + maxYabs.toFixed(1));
+  console.log('lotus-boat self-check ran: max turn', maxW.toFixed(2), 'rad/s, arc width', maxYabs.toFixed(0), 'px');
 }
 
 layout();
