@@ -4,12 +4,17 @@ A calm pond game built from a viral motion video: a boat, a boatman, and lotus f
 
 ## Status
 
-Pre-build. Only the README exists. Reference video not uploaded yet.
+Prototype in `index.html`. Open it in a browser (no build step).
 
 ## Reference video
 
-- Planned location: `assets/reference/viral-video.mp4`
-- Used to match lotus bounce motion, boat movement, and timing.
+- `Zepto animation.mp4` is the reference for lotus, boat, and timing.
+
+## Assets
+
+- `assets/asset-sheet.webp`: source art sheet.
+- `assets/sprites/*.png`: sprites cut from the sheet with `python3 assets/cut_sprites.py assets/asset-sheet.webp assets/sprites`.
+- Waves are drawn in code, not from an image.
 
 ## Screens
 
