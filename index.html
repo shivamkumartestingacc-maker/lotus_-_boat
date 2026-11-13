@@ -5,26 +5,40 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Lotus Boat</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #7fc0ef; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #66a9e2; }
   canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
   .glass {
     position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 28px);
     transform: translateX(-50%);
-    padding: 14px 28px; border-radius: 999px;
-    border: 1px solid rgba(255,255,255,.55);
-    background: linear-gradient(135deg, rgba(255,255,255,.32), rgba(255,255,255,.12));
-    -webkit-backdrop-filter: blur(16px) saturate(160%); backdrop-filter: blur(16px) saturate(160%);
-    box-shadow: 0 10px 30px rgba(10,60,110,.25), inset 0 1px 0 rgba(255,255,255,.6);
-    color: #fff; font: 600 16px/1 system-ui, -apple-system, sans-serif; letter-spacing: .3px;
-    text-shadow: 0 1px 2px rgba(0,40,80,.35);
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 16px 30px; border-radius: 999px;
+    border: 1px solid rgba(206,198,255,.75);
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .35 0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E"),
+      linear-gradient(180deg, rgba(118,100,255,.82), rgba(96,76,246,.82));
+    -webkit-backdrop-filter: blur(14px) saturate(150%); backdrop-filter: blur(14px) saturate(150%);
+    box-shadow:
+      0 0 0 1px rgba(140,120,255,.35),
+      0 0 22px 4px rgba(124,104,255,.7),
+      0 0 60px 12px rgba(108,88,255,.35),
+      inset 0 -7px 14px -4px rgba(255,255,255,.55),
+      inset 0 2px 5px rgba(255,255,255,.25);
+    color: #fff; font: 500 17px/1 system-ui, -apple-system, "Segoe UI", sans-serif; letter-spacing: .2px;
+    text-shadow: 0 1px 3px rgba(40,20,140,.45);
     cursor: pointer; white-space: nowrap;
+    transition: box-shadow .2s, transform .2s;
   }
-  .glass.flash { background: rgba(255,255,255,.45); }
+  .glass svg { width: 18px; height: 18px; flex: none; }
+  .glass:hover { box-shadow: 0 0 0 1px rgba(160,140,255,.5), 0 0 28px 6px rgba(124,104,255,.85), 0 0 70px 16px rgba(108,88,255,.45), inset 0 -7px 14px -4px rgba(255,255,255,.6), inset 0 2px 5px rgba(255,255,255,.3); }
+  .glass:focus-visible { outline: 2px solid #fff; outline-offset: 4px; }
+  .glass.flash { transform: translateX(-50%) scale(.97); }
 </style>
 </head>
 <body>
 <canvas id="pond"></canvas>
-<button class="glass" id="soon" type="button">Game coming soon</button>
+<button class="glass" id="soon" type="button">Game coming soon
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l17 8-17 8 3-8-3-8z"/><path d="M7 12h14"/></svg>
+</button>
 <script>
 const cv = document.getElementById('pond');
 const ctx = cv.getContext('2d');
@@ -60,6 +74,9 @@ let W = 0, H = 0, DPR = 1, k = 1, time = 0, last = 0, ready = false;
 const boat = { x: 0, y: 0, vx: 0, vy: 0, heading: -0.3, w: 0, throttle: 0, stroke: 0 };
 let items = [], ripples = [], nextRipple = 0;
 let mode = 'idle';        // idle | drag | draw | follow
+const guide = { on: true, a: 0, t0: 0 }; // spotlight tutorial
+let lastInput = 0;
+const IDLE_GUIDE = 60;                   // s without input before the guide comes back
 let grab = { x: 0, y: 0 }, dragT = { x: 0, y: 0 };
 let drawPts = [];
 let follow = null;
@@ -109,7 +126,7 @@ function bake(im, s, blur = 7, alpha = 0.35) {
 
 // sprite + separate blurred silhouette, so the shadow can sit at a fixed world offset (sun stays put
 // while pads rotate). Silhouette trick: draw the sprite off-canvas, let only its shadow land inside.
-function bakeSplit(im, s, blur = 6, color = 'rgba(4,22,55,0.6)') {
+function bakeSplit(im, s, blur = 6, color = 'rgba(2,16,44,0.78)') {
   const pad = blur * 2, w = im.width * s + pad * 2, h = im.height * s + pad * 2, far = 10000;
   const b = offscreen(w, h, g => g.drawImage(im, pad, pad, im.width * s, im.height * s));
   b.sh = offscreen(w, h, g => {
@@ -292,8 +309,35 @@ function pilotPath() {
   return { heading, throttle: throttleFor(Math.min(V_PATH * k * bend, 20 * k + remain * 0.8)) };
 }
 
+// any scribble becomes a smooth curve: keep only its turning points (RDP), then round them off (Chaikin)
+function segDist(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy || 1;
+  const t = clamp(((p.x - a.x) * dx + (p.y - a.y) * dy) / l2, 0, 1);
+  return Math.hypot(p.x - a.x - t * dx, p.y - a.y - t * dy);
+}
+function rdp(pts, eps) {
+  if (pts.length < 3) return pts;
+  let dmax = 0, idx = 0;
+  for (let i = 1; i < pts.length - 1; i++) { const d = segDist(pts[i], pts[0], pts[pts.length - 1]); if (d > dmax) { dmax = d; idx = i; } }
+  if (dmax <= eps) return [pts[0], pts[pts.length - 1]];
+  return rdp(pts.slice(0, idx + 1), eps).slice(0, -1).concat(rdp(pts.slice(idx), eps));
+}
+function chaikin(pts, iters) {
+  for (let n = 0; n < iters; n++) {
+    const out = [pts[0]];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i], b = pts[i + 1];
+      out.push({ x: a.x * 0.75 + b.x * 0.25, y: a.y * 0.75 + b.y * 0.25 }, { x: a.x * 0.25 + b.x * 0.75, y: a.y * 0.25 + b.y * 0.75 });
+    }
+    out.push(pts[pts.length - 1]); pts = out;
+  }
+  return pts;
+}
+const smoothPath = pts => chaikin(rdp(pts, 14 * k), 4);
+
 function startFollow() {
-  const pts = drawPts; drawPts = [];
+  const pts = smoothPath(drawPts); drawPts = [];
+  guide.on = false;
   const cum = [0];
   for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
   const L = cum[cum.length - 1];
@@ -364,7 +408,15 @@ function updateRipples(dt) {
     const t = paddleGeom().tip, c = Math.cos(boat.heading), s = Math.sin(boat.heading);
     ripples.push({ x: boat.x + (t.x * c - t.y * s) * k, y: boat.y + (t.x * s + t.y * c) * k, ang: boat.heading, t0: time, life: 1.4, a: 9 * k, b: 6 * k });
   }
-  ripples = ripples.filter(r => time - r.t0 < r.life).slice(-40);
+  const reach = HULL_A * k + 80 * k;
+  for (const p of items) {
+    if (p.type === 'dot' || time < (p.ringAt || 0)) continue;
+    if ((sp > 15 * k || p.push) && Math.hypot(p.x - boat.x, p.y - boat.y) < reach + p.r) {
+      ripples.push({ x: p.x, y: p.y, ang: 0, t0: time, life: 1.7, a: p.r * 1.05, b: p.r * 1.05, item: true });
+      p.ringAt = time + 0.6 + Math.random() * 0.4;
+    }
+  }
+  ripples = ripples.filter(r => time - r.t0 < r.life).slice(-120);
 }
 
 function drawRipples() {
@@ -372,9 +424,10 @@ function drawRipples() {
   for (const r of ripples) {
     const u = (time - r.t0) / r.life, grow = 1 + u * 1.1;
     ctx.globalAlpha = 0.6 * (1 - u) * (1 - u);
-    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.5 * (1 - u) + 0.6;
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = (r.item ? 3 : 4.5) * (1 - u) + 1;
     ctx.beginPath();
-    ctx.ellipse(r.x, r.y, r.a * grow + u * 24 * k, r.b * grow + u * 34 * k, r.ang, 0, TAU);
+    const ex = r.item ? u * 22 * k : u * 24 * k, ey = r.item ? u * 22 * k : u * 34 * k;
+    ctx.ellipse(r.x, r.y, r.a * grow + ex, r.b * grow + ey, r.ang, 0, TAU);
     ctx.stroke();
   }
   ctx.restore();
@@ -390,7 +443,7 @@ function onBoat(x, y) {
 cv.addEventListener('pointerdown', e => {
   if (!ready) return;
   const x = e.clientX, y = e.clientY;
-  follow = null;
+  follow = null; lastInput = time; guide.on = false;
   cv.setPointerCapture(e.pointerId);
   if (onBoat(x, y)) { mode = 'drag'; grab = { x: boat.x - x, y: boat.y - y }; dragT = { x: boat.x, y: boat.y }; }
   else { mode = 'draw'; drawPts = [{ x: boat.x, y: boat.y }, { x, y }]; }
@@ -398,6 +451,7 @@ cv.addEventListener('pointerdown', e => {
 
 cv.addEventListener('pointermove', e => {
   const x = clamp(e.clientX, 0, W), y = clamp(e.clientY, 0, H);
+  if (mode !== 'idle' && mode !== 'follow') lastInput = time;
   if (mode === 'drag') dragT = { x: x + grab.x, y: y + grab.y };
   else if (mode === 'draw') {
     const l = drawPts[drawPts.length - 1];
@@ -412,6 +466,7 @@ cv.addEventListener('pointercancel', endPointer);
 addEventListener('keydown', e => {
   if (!ARROWS[e.key]) return;
   e.preventDefault(); keys.add(e.key);
+  lastInput = time; guide.on = false;
   if (mode === 'follow') { follow = null; mode = 'idle'; }
 });
 addEventListener('keyup', e => keys.delete(e.key));
@@ -426,7 +481,7 @@ document.getElementById('soon').addEventListener('click', e => {
 // ---------- drawing ----------
 function drawWater() {
   const g = ctx.createLinearGradient(0, 0, W, H);
-  g.addColorStop(0, '#8fcbf4'); g.addColorStop(1, '#6db3ea');
+  g.addColorStop(0, '#78b9ec'); g.addColorStop(1, '#5599d8');
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
   waveLayers.forEach((c, i) => {
     const v = WAVE_LAYERS[i].vel;
@@ -492,6 +547,55 @@ function drawBoat() {
   ctx.restore();
 }
 
+// ---------- spotlight guide: a hand draws an S-curve from the bow, with how-to text ----------
+function bez(p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  return { x: u * u * u * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * p3.x,
+           y: u * u * u * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t * t * t * p3.y };
+}
+
+function drawGuide(dt) {
+  if (!guide.on && mode !== 'drag' && mode !== 'draw' && time - lastInput > IDLE_GUIDE) { guide.on = true; guide.t0 = time; }
+  guide.a += ((guide.on ? 1 : 0) - guide.a) * Math.min(1, 4 * dt);
+  if (guide.a < 0.01) return;
+  const ch = Math.cos(boat.heading), sh = Math.sin(boat.heading);
+  const B = { x: boat.x + ch * HULL_A * k * 0.9, y: boat.y + sh * HULL_A * k * 0.9 };   // bow
+  let dx = W / 2 - B.x, dy = H / 2 - B.y; const dl = Math.hypot(dx, dy) || 1; dx /= dl; dy /= dl;
+  const L = clamp(dl, 160 * k, 340 * k), px = -dy, py = dx;
+  const P1 = { x: B.x + dx * L * 0.33 + px * L * 0.32, y: B.y + dy * L * 0.33 + py * L * 0.32 };
+  const P2 = { x: B.x + dx * L * 0.66 - px * L * 0.32, y: B.y + dy * L * 0.66 - py * L * 0.32 };
+  const E = { x: B.x + dx * L, y: B.y + dy * L };
+  const C = { x: B.x + dx * L * 0.5, y: B.y + dy * L * 0.5 }, R = L * 0.5 + 150 * k;
+
+  ctx.save();
+  ctx.globalAlpha = guide.a;
+  const g = ctx.createRadialGradient(C.x, C.y, R * 0.6, C.x, C.y, R * 1.25);
+  g.addColorStop(0, 'rgba(6,22,48,0)'); g.addColorStop(1, 'rgba(6,22,48,0.62)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  const cyc = (time - guide.t0) % 3.4, t = smooth(clamp(cyc / 2.3, 0, 1));
+  const fadeHand = cyc > 2.9 ? 1 - (cyc - 2.9) / 0.5 : 1;
+  const trail = [];
+  for (let i = 0; i <= 48; i++) trail.push(bez(B, P1, P2, E, t * i / 48));
+  ctx.globalAlpha = guide.a * fadeHand;
+  drawLine(trail, [2, 12]);
+  const h = trail[trail.length - 1], fs = 46 * k;
+  ctx.font = `${fs}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
+  ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+  ctx.shadowColor = 'rgba(0,0,0,0.35)'; ctx.shadowBlur = 8;
+  ctx.fillText('👆', h.x - fs * 0.38, h.y - fs * 0.08);              // fingertip on the line
+
+  ctx.globalAlpha = guide.a;
+  const above = C.y - R * 0.62, ty = above > 70 ? above : clamp(C.y + R * 0.72, 70, H - 150);   // keep text off the boat
+  ctx.textAlign = 'center'; ctx.fillStyle = '#ffffff'; ctx.shadowColor = 'rgba(0,30,70,0.6)'; ctx.shadowBlur = 10;
+  ctx.font = `700 ${Math.round(22 * Math.max(k, 0.8))}px system-ui, -apple-system, sans-serif`;
+  const tx = clamp(C.x, 160, W - 160);
+  ctx.fillText('Draw a path for the boat', tx, ty);
+  ctx.font = `500 ${Math.round(16 * Math.max(k, 0.8))}px system-ui, -apple-system, sans-serif`;
+  ctx.fillText('or press  \u2191  \u2193  \u2190  \u2192  to row', tx, ty + 34 * Math.max(k, 0.8));
+  ctx.restore();
+}
+
 // ---------- loop ----------
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000 || 0); last = now; time += dt;
@@ -507,11 +611,12 @@ function frame(now) {
     updateItems();
     collide();
     drawRipples();
-    if (mode === 'draw') drawLine(drawPts, [2, 12]);
+    if (mode === 'draw') drawLine(smoothPath(drawPts), [2, 12]);
     if (mode === 'follow') drawLine(follow.pts, [2, 12]);
     for (const p of items) drawItem(p);
     if (mode === 'drag') drawLine([{ x: boat.x, y: boat.y }, dragT], [1, 9]);   // tow line
     drawBoat();
+    drawGuide(dt);
   }
   requestAnimationFrame(frame);
 }
