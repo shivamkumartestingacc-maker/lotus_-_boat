@@ -440,6 +440,7 @@ function onBoat(x, y) {
 
 cv.addEventListener('pointerdown', e => {
   if (!ready) return;
+  startAudio();
   const x = e.clientX, y = e.clientY;
   follow = null; lastInput = time; guide.on = false;
   cv.setPointerCapture(e.pointerId);
@@ -463,7 +464,7 @@ cv.addEventListener('pointercancel', endPointer);
 
 addEventListener('keydown', e => {
   if (!ARROWS[e.key]) return;
-  e.preventDefault(); keys.add(e.key);
+  e.preventDefault(); keys.add(e.key); startAudio();
   lastInput = time; guide.on = false;
   if (mode === 'follow') { follow = null; mode = 'idle'; }
 });
@@ -543,6 +544,35 @@ function drawBoat() {
   ctx.scale(1 / k, 1 / k);
   ctx.drawImage(bodyBaked.c, -bodyBaked.w / 2, -bodyBaked.h / 2, bodyBaked.w, bodyBaked.h);
   ctx.restore();
+}
+
+// ---------- water sound: brown noise through a band filter, loud only while the hull moves ----------
+// Browsers allow audio only after a user gesture, so it starts on the first press or key.
+let audio = null;
+function startAudio() {
+  if (audio) { if (audio.ctx.state !== 'running') audio.ctx.resume(); return; }
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const len = ctx.sampleRate * 3, buf = ctx.createBuffer(1, len, ctx.sampleRate), d = buf.getChannelData(0);
+    let b = 0;
+    for (let i = 0; i < len; i++) { b = (b + 0.02 * (Math.random() * 2 - 1)) / 1.02; d[i] = b * 3.5; }   // brown noise
+    const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 140;
+    const bp = ctx.createBiquadFilter(); bp.type = 'lowpass'; bp.frequency.value = 450; bp.Q.value = 0.7;
+    const gain = ctx.createGain(); gain.gain.value = 0;
+    src.connect(hp); hp.connect(bp); bp.connect(gain); gain.connect(ctx.destination);
+    src.start();
+    audio = { ctx, gain, bp };
+  } catch (e) { audio = null; }
+}
+
+function updateAudio() {
+  if (!audio) return;
+  const sp = Math.hypot(boat.vx, boat.vy) / (CRUISE * k);             // 0 idle, ~1 cruising
+  const lap = 0.75 + 0.25 * Math.sin(time * 3.5);                     // slow lapping swell
+  const t = audio.ctx.currentTime;
+  audio.gain.gain.setTargetAtTime(Math.min(0.45, sp * 0.3) * lap, t, 0.12);
+  audio.bp.frequency.setTargetAtTime(450 + Math.min(1, sp) * 800, t, 0.25);   // hiss opens up with speed
 }
 
 // ---------- spotlight guide: a hand draws an S-curve from the bow, with how-to text ----------
@@ -628,6 +658,7 @@ function frame(now) {
     if (mode === 'drag') drawLine([{ x: boat.x, y: boat.y }, dragT], [1, 9]);   // tow line
     drawBoat();
     drawGuide(dt);
+    updateAudio();
   }
   requestAnimationFrame(frame);
 }
