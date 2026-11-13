@@ -28,7 +28,6 @@
     cursor: pointer; white-space: nowrap;
     transition: box-shadow .2s, transform .2s;
   }
-  .glass svg { width: 18px; height: 18px; flex: none; }
   .glass:hover { box-shadow: 0 0 0 1px rgba(160,140,255,.5), 0 0 28px 6px rgba(124,104,255,.85), 0 0 70px 16px rgba(108,88,255,.45), inset 0 -7px 14px -4px rgba(255,255,255,.6), inset 0 2px 5px rgba(255,255,255,.3); }
   .glass:focus-visible { outline: 2px solid #fff; outline-offset: 4px; }
   .glass.flash { transform: translateX(-50%) scale(.97); }
@@ -37,7 +36,6 @@
 <body>
 <canvas id="pond"></canvas>
 <button class="glass" id="soon" type="button">Game coming soon
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l17 8-17 8 3-8-3-8z"/><path d="M7 12h14"/></svg>
 </button>
 <script>
 const cv = document.getElementById('pond');
@@ -586,13 +584,26 @@ function drawGuide(dt) {
   ctx.fillText('👆', h.x - fs * 0.38, h.y - fs * 0.08);              // fingertip on the line
 
   ctx.globalAlpha = guide.a;
-  const above = C.y - R * 0.62, ty = above > 70 ? above : clamp(C.y + R * 0.72, 70, H - 150);   // keep text off the boat
-  ctx.textAlign = 'center'; ctx.fillStyle = '#ffffff'; ctx.shadowColor = 'rgba(0,30,70,0.6)'; ctx.shadowBlur = 10;
-  ctx.font = `700 ${Math.round(22 * Math.max(k, 0.8))}px system-ui, -apple-system, sans-serif`;
-  const tx = clamp(C.x, 160, W - 160);
-  ctx.fillText('Draw a path for the boat', tx, ty);
-  ctx.font = `500 ${Math.round(16 * Math.max(k, 0.8))}px system-ui, -apple-system, sans-serif`;
-  ctx.fillText('or press  \u2191  \u2193  \u2190  \u2192  to row', tx, ty + 34 * Math.max(k, 0.8));
+  const fs1 = Math.round(24 * Math.max(k, 0.85)), fs2 = Math.round(17 * Math.max(k, 0.85));
+  const l1 = 'Draw a path for the boat', l2 = 'or press  \u2191  \u2193  \u2190  \u2192  to row';
+  ctx.font = `700 ${fs1}px system-ui, -apple-system, sans-serif`;
+  const w1 = ctx.measureText(l1).width;
+  ctx.font = `600 ${fs2}px system-ui, -apple-system, sans-serif`;
+  const w2 = ctx.measureText(l2).width;
+  const padX = 22 * k, bw = Math.max(w1, w2) + padX * 2, bh = fs1 + fs2 + 30 * k, bx = clamp(C.x - bw / 2, 12, W - bw - 12);
+  const above = C.y - R * 0.62, by = above - bh > 12 ? above - bh : clamp(C.y + R * 0.72, 12, H - bh - 120);
+  ctx.shadowColor = 'rgba(0,0,0,0)'; ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(8,26,64,0.72)';                             // dark plate behind the text
+  ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 18 * k); ctx.fill();
+  ctx.strokeStyle = 'rgba(190,210,255,0.5)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillStyle = '#ffffff';
+  ctx.shadowColor = 'rgba(0,0,0,0.4)'; ctx.shadowBlur = 6;
+  const cx = bx + bw / 2;
+  ctx.font = `700 ${fs1}px system-ui, -apple-system, sans-serif`;
+  ctx.fillText(l1, cx, by + 14 * k);
+  ctx.font = `600 ${fs2}px system-ui, -apple-system, sans-serif`;
+  ctx.fillStyle = '#cfe3ff';
+  ctx.fillText(l2, cx, by + 14 * k + fs1 + 6 * k);
   ctx.restore();
 }
 
